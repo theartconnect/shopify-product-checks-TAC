@@ -16,9 +16,6 @@ const MAKE_WEBHOOK_URL = 'https://hook.eu2.make.com/tescg3fg0hnlnyst64e6wpiafuhr
 const UNIT_PRICE_WEBHOOK_URL = 'https://hook.eu2.make.com/teqrpwmekmddfium11jm3ks5ahw41jkw';
 const SKU_MAKE_URL = 'https://hook.eu2.make.com/1f5zs1xu49pgay2ytei5k2v2tbfw774k';
 
-const COSMETIC_COLLECTION_HANDLE = 'cosmetic-supplies-missing-metafield';
-const COSMETIC_COLLECTION_FRIENDLY = 'Cosmetic Supplies Missing Metafield';
-
 // Metafield list values
 const LABEL_NEW_PRODUCT_CHECKS = 'New Product Checks';
 const LABEL_TITLE_UPDATED      = 'Title Updated';
@@ -124,16 +121,8 @@ const PRODUCTS_PAGE_QUERY = `
         }
         metafieldChanges: metafield(namespace: "custom", key: "product_changes") { value }
         metafieldTax: metafield(namespace: "custom", key: "indian_tax_rate") { value }
-        metafieldPreOrder: metafield(namespace: "custom", key: "new_pre_order_setting") { value }
+        metafieldPreOrder: metafield(namespace: "custom", key: "pre_order_setting") { value }
         metafieldOrigin: metafield(namespace: "my_fields", key: "country_of_origin") { value }
-        metafieldCosmetics: metafield(namespace: "custom", key: "cosmetic_supplies") {
-          references(first: 1) {
-            nodes {
-              __typename
-              ... on Metaobject { id }
-            }
-          }
-        }
       }
     }
   }
@@ -166,14 +155,6 @@ const COLLECTIONS_PAGE_QUERY = `
         pageInfo { hasNextPage endCursor }
         nodes { title handle }
       }
-    }
-  }
-`;
-
-const FIND_COLLECTION_BY_HANDLE = `
-  query FindCollectionByHandle($q: String!) {
-    collections(first: 1, query: $q) {
-      nodes { id title handle }
     }
   }
 `;
@@ -255,16 +236,6 @@ const LOCATIONS_QUERY = `
 const INVENTORY_SET_ON_HAND = `
   mutation SetOnHand($input: InventorySetOnHandQuantitiesInput!) {
     inventorySetOnHandQuantities(input: $input) {
-      userErrors { field message }
-    }
-  }
-`;
-
-/* Collections (for cosmetic note) */
-const COLLECTION_ADD_PRODUCTS = `
-  mutation CollectionAddProducts($id: ID!, $productIds: [ID!]!) {
-    collectionAddProducts(id: $id, productIds: $productIds) {
-      collection { id }
       userErrors { field message }
     }
   }
@@ -404,17 +375,6 @@ async function updateInventoryItemCountry(id, countryCode) {
   const data = await shopifyGraphQL(INVENTORY_ITEM_UPDATE, { id, input: { countryCodeOfOrigin: countryCode } });
   const errs = data.inventoryItemUpdate.userErrors || [];
   if (errs.length) throw new Error(`inventoryItemUpdate: ${JSON.stringify(errs)}`);
-}
-
-async function ensureAddedToCollectionByHandle(productId, handle) {
-  const data = await shopifyGraphQL(FIND_COLLECTION_BY_HANDLE, { q: `handle:${handle}` });
-  const col = data.collections?.nodes?.[0];
-  if (!col) return { ok: false, note: `Collection '${handle}' not found.` };
-  if (IS_DRY_RUN) return { ok: true, note: `Would add to '${col.title}' (DRY RUN).` };
-  const res = await shopifyGraphQL(COLLECTION_ADD_PRODUCTS, { id: col.id, productIds: [productId] });
-  const errs = res.collectionAddProducts?.userErrors || [];
-  if (errs.length) return { ok: false, note: `Failed to add to '${col.title}': ${errs.map(e => e.message).join('; ')}` };
-  return { ok: true, note: `Added to '${col.title}'.` };
 }
 
 function variantLabel(v) {
@@ -646,7 +606,7 @@ function linkedOptionName(productNode) {
 function selectedValueForLinkedOption(variantNode, linkedName) {
   if (!linkedName) return null;
   const hit = (variantNode?.selectedOptions || []).find(so => so.name === linkedName);
-  return hit ? String(hit.value).trim() : null;
+  return hit ? String(so.value).trim() : null;
 }
 function handleFromOptionValue(value) {
   return String(value).trim().toLowerCase().replace(/\s+/g, '-');
@@ -730,8 +690,8 @@ async function callMakeWebhook(payload) {
 }
 async function callUnitPriceWebhook(productId) {
   try {
-    const res = await axios.post(UNIT_PRICE_WEBHOOK_URL, { store: 'FI' }, {
-      headers: { store: 'FI', productid: productId },
+    const res = await axios.post(UNIT_PRICE_WEBHOOK_URL, { store: 'TAC' }, {
+      headers: { store: 'TAC', productid: productId },
       timeout: 30000
     });
     return { ok: res.status === 200, status: res.status };
@@ -781,7 +741,7 @@ async function run() {
       try {
         if (productChanges.includes(LABEL_TITLE_UPDATED)) {
           hadMakeTests = true;
-          const r = await callMakeWebhook({ store: 'FI', title_modified: true, product_id: p.id });
+          const r = await callMakeWebhook({ store: 'TAC', title_modified: true, product_id: p.id });
           if (r.ok) {
             slackMakeLines.push('Title update information sent.');
             const newList = productChanges.filter(v => v !== LABEL_TITLE_UPDATED);
@@ -793,7 +753,7 @@ async function run() {
         }
         if (productChanges.includes(LABEL_PRICE_UPDATED)) {
           hadMakeTests = true;
-          const r = await callMakeWebhook({ store: 'FI', price_modified: true, product_id: p.id });
+          const r = await callMakeWebhook({ store: 'TAC', price_modified: true, product_id: p.id });
           if (r.ok) {
             slackMakeLines.push('Price update information sent.');
             const newList = productChanges.filter(v => v !== LABEL_PRICE_UPDATED);
@@ -813,7 +773,7 @@ async function run() {
           }
           if (hsSet.size === 1) {
             const hsnValue = [...hsSet][0];
-            const r = await callMakeWebhook({ store: 'FI', hsn_modified: true, hsn_value: hsnValue, product_id: p.id });
+            const r = await callMakeWebhook({ store: 'TAC', hsn_modified: true, hsn_value: hsnValue, product_id: p.id });
             if (r.ok) {
               slackMakeLines.push('HSN update information sent.');
               const newList = productChanges.filter(v => v !== LABEL_HSN_UPDATED);
@@ -836,7 +796,7 @@ async function run() {
             const m = taxRaw5.match(/^([0-9]+(?:\.[0-9]+)?)%(.*)$/);
             if (m) { tax_percentage = m[1]; tax_id = (m[2] || '').trim(); }
           }
-          const r = await callMakeWebhook({ store: 'FI', tax_modified: true, tax_percentage, tax_id, product_id: p.id });
+          const r = await callMakeWebhook({ store: 'TAC', tax_modified: true, tax_percentage, tax_id, product_id: p.id });
           if (r.ok) {
             slackMakeLines.push('Tax update information sent.');
             const newList = productChanges.filter(v => v !== LABEL_TAX_UPDATED);
@@ -854,7 +814,7 @@ async function run() {
       const hasNewProductChecks = productChanges.includes(LABEL_NEW_PRODUCT_CHECKS);
 
       // Slack base message & bucket
-      let slackMsg = `FI Store - Product "${p.title}"`;
+      let slackMsg = `TAC Store - Product "${p.title}"`;
       const slackParts = [];
 
       if (!hasNewProductChecks && !hadMakeTests) continue;
@@ -916,16 +876,6 @@ async function run() {
             }
           }
           linkCheckFailed = !anyLinked;
-        }
-
-        // Cosmetic supplies: only if title contains "cosmetic" (non-blocking)
-        const titleHasCosmetic = /\bcosmetic\b/i.test(p.title || '');
-        if (titleHasCosmetic) {
-          const refs = p.metafieldCosmetics?.references?.nodes || [];
-          if (refs.length === 0) {
-            await ensureAddedToCollectionByHandle(p.id, COSMETIC_COLLECTION_HANDLE);
-            slackParts.push(`\nNote: Cosmetic supplies metafield missing; added to '${COSMETIC_COLLECTION_FRIENDLY}'.`);
-          }
         }
 
         // Zero stock across all locations
@@ -1149,7 +1099,7 @@ async function run() {
                 const count = items.length;
                 const skus = items.map(it => it.sku);
                 const payload = {
-                  store: 'FI',
+                  store: 'TAC',
                   product_id: p.id,
                   tax_percentage,
                   tax_id,
