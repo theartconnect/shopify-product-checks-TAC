@@ -7,7 +7,8 @@ const SHOPIFY_STORE_DOMAIN = env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = env.SHOPIFY_API_VERSION || '2025-07';
 const SLACK_BOT_TOKEN = env.SLACK_BOT_TOKEN;
-const SLACK_CHANNEL_ID = env.SLACK_CHANNEL_ID;
+const SLACK_CHANNEL_ID = env.SLACK_CHANNEL_ID; // default / failures / needs-attention
+const SUCCESS_SLACK_CHANNEL_ID = env.SUCCESS_SLACK_CHANNEL_ID; // successes go here if set
 const DRY_RUN = env.DRY_RUN || 'true';
 const IS_DRY_RUN = String(DRY_RUN).toLowerCase() === 'true';
 const LOG_EVERY_CALL = String(env.SHOPIFY_LOG_GRAPHQL_COSTS || 'false').toLowerCase() === 'true';
@@ -30,6 +31,9 @@ if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
 if (!SLACK_BOT_TOKEN || !SLACK_CHANNEL_ID) {
   console.error('Missing SLACK_BOT_TOKEN or SLACK_CHANNEL_ID in .env');
   if (globalThis.process && globalThis.process.exit) globalThis.process.exit(1);
+}
+if (!SUCCESS_SLACK_CHANNEL_ID) {
+  console.warn('SUCCESS_SLACK_CHANNEL_ID not set; success messages will post to default channel.');
 }
 
 const SHOPIFY_GRAPHQL_URL = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
@@ -79,12 +83,15 @@ async function shopifyGraphQL(query, variables = {}) {
   }
 }
 
-async function slackPost(text) {
+// Route messages: success -> SUCCESS_SLACK_CHANNEL_ID (if set), else default channel
+async function slackPost(text, { success = false } = {}) {
   const prefix = IS_DRY_RUN ? '[DRY RUN] ' : '';
   const body = `${prefix}${text}\n----------`;
+  const channel = success && SUCCESS_SLACK_CHANNEL_ID ? SUCCESS_SLACK_CHANNEL_ID : SLACK_CHANNEL_ID;
+
   await axios.post(
     'https://slack.com/api/chat.postMessage',
-    { channel: SLACK_CHANNEL_ID, text: body },
+    { channel, text: body },
     { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
@@ -606,7 +613,7 @@ function linkedOptionName(productNode) {
 function selectedValueForLinkedOption(variantNode, linkedName) {
   if (!linkedName) return null;
   const hit = (variantNode?.selectedOptions || []).find(so => so.name === linkedName);
-  return hit ? String(so.value).trim() : null;
+  return hit ? String(hit.value).trim() : null;
 }
 function handleFromOptionValue(value) {
   return String(value).trim().toLowerCase().replace(/\s+/g, '-');
@@ -731,6 +738,9 @@ async function run() {
       if (!productChanges.length) continue;
       matchedAny++;
 
+      // Track if any sub-action failed (used for Slack routing)
+      let anyWebhookFailed = false;
+
       // Publish to India market publication on scan
       await ensureProductInIndiaCatalog(p.id);
 
@@ -748,6 +758,7 @@ async function run() {
             await setProductChangesList(p.id, JSON.stringify(newList));
             productChanges.splice(0, productChanges.length, ...newList);
           } else {
+            anyWebhookFailed = true;
             slackMakeLines.push(`Title update failed${r.status ? ` (HTTP ${r.status})` : ''}.`);
           }
         }
@@ -760,6 +771,7 @@ async function run() {
             await setProductChangesList(p.id, JSON.stringify(newList));
             productChanges.splice(0, productChanges.length, ...newList);
           } else {
+            anyWebhookFailed = true;
             slackMakeLines.push(`Price update failed${r.status ? ` (HTTP ${r.status})` : ''}.`);
           }
         }
@@ -780,11 +792,14 @@ async function run() {
               await setProductChangesList(p.id, JSON.stringify(newList));
               productChanges.splice(0, productChanges.length, ...newList);
             } else {
+              anyWebhookFailed = true;
               slackMakeLines.push(`HSN update failed${r.status ? ` (HTTP ${r.status})` : ''}.`);
             }
           } else if (hsSet.size === 0) {
+            anyWebhookFailed = true;
             slackMakeLines.push('HSN update not sent: HS code missing on all variants.');
           } else {
+            anyWebhookFailed = true;
             slackMakeLines.push('HSN update not sent: variants have inconsistent HS codes.');
           }
         }
@@ -803,10 +818,12 @@ async function run() {
             await setProductChangesList(p.id, JSON.stringify(newList));
             productChanges.splice(0, productChanges.length, ...newList);
           } else {
+            anyWebhookFailed = true;
             slackMakeLines.push(`Tax update failed${r.status ? ` (HTTP ${r.status})` : ''}.`);
           }
         }
       } catch (e) {
+        anyWebhookFailed = true;
         slackMakeLines.push('Webhook processing encountered an unexpected error.');
         console.error('Webhook block error:', e?.response?.data || e.message || e);
       }
@@ -820,7 +837,7 @@ async function run() {
       if (!hasNewProductChecks && !hadMakeTests) continue;
 
       if (hasNewProductChecks) {
-        // ---- New Product Checks (formerly Test1)
+        // ---- New Product Checks
         const indianTaxRateRaw = parseStringFromMetafield(p.metafieldTax);
         const hasIndianTax = !!indianTaxRateRaw;
         const percentStr = parseTaxPercent(indianTaxRateRaw);
@@ -847,15 +864,11 @@ async function run() {
         // Main-item classification (all patterned SKUs are -0)
         let foundPattern = false;
         let allZeroDigits = true;
-        const groupMeta = new Map();
         for (const v of allVariants) {
           const parts = expectedMainSkuParts(v.sku || '');
           if (!parts) continue;
           foundPattern = true;
           if (parts.digits !== 0) allZeroDigits = false;
-          const key = parts.groupKey;
-          if (!groupMeta.has(key)) groupMeta.set(key, { base: parts.base, tail: parts.tail, expectedMain: parts.candidate, hasNonZero: false });
-          if (parts.digits !== 0) groupMeta.get(key).hasNonZero = true;
         }
         const productIsMainItem = foundPattern && allZeroDigits;
 
@@ -1013,6 +1026,7 @@ async function run() {
               if (anyOptionLinkedToVQ) {
                 const up = await callUnitPriceWebhook(p.id);
                 unitPriceOK = up.ok;
+                if (!up.ok) anyWebhookFailed = true;
                 unitPriceNote = up.ok
                   ? '\nNote: Data sent for Unit Price Update.'
                   : '\nNote: Error in sending data for Unit Price Update.';
@@ -1110,7 +1124,10 @@ async function run() {
                 };
 
                 const r = await callSkuArrayWebhook(payload);
-                if (!r.ok) allSkuGroupsOK = false;
+                if (!r.ok) {
+                  anyWebhookFailed = true;
+                  allSkuGroupsOK = false;
+                }
               }
 
               skuNote = allSkuGroupsOK
@@ -1155,9 +1172,9 @@ async function run() {
             missingMainGroups
           });
 
-          const allVariants = await getAllVariants(p.id, p.variants);
-          const variantIssueRows = [];
-          for (const v of allVariants) {
+          const allVariants2 = await getAllVariants(p.id, p.variants);
+          const variantIssueRows2 = [];
+          for (const v of allVariants2) {
             const label = variantLabel(v);
             const sku = v.sku ? String(v.sku).trim() : '';
             const hs = v.inventoryItem?.harmonizedSystemCode ? String(v.inventoryItem.harmonizedSystemCode).trim() : '';
@@ -1172,12 +1189,12 @@ async function run() {
             if (parts && mainExists === 'No') hasIssue = true;
             if (!sku && parts) hasIssue = true;
             if (hasIssue) {
-              variantIssueRows.push({ label, sku: sku || 'Fill in', hs: hs || 'Fill in', mainExists });
+              variantIssueRows2.push({ label, sku: sku || 'Fill in', hs: hs || 'Fill in', mainExists });
             }
           }
 
-          const tableBlock = variantIssueRows.length ? ('\n\n' + buildVariantIssueTable(variantIssueRows, parseStringFromMetafield(p.metafieldOrigin))) : '';
-          const makeStatus = (hadMakeTests && slackMakeLines.length)
+          const tableBlock2 = variantIssueRows2.length ? ('\n\n' + buildVariantIssueTable(variantIssueRows2, parseStringFromMetafield(p.metafieldOrigin))) : '';
+          const makeStatus2 = (hadMakeTests && slackMakeLines.length)
             ? `\n\nMake Webhook Stats -\n${slackMakeLines.map(l => `- ${l}`).join('\n')}`
             : '';
 
@@ -1188,19 +1205,32 @@ async function run() {
 
           const draftNote = wasActive ? `\n\nAction: Product has been set to DRAFT from ACTIVE.` : '';
           const header = lines.length ? `failed checks:\n${formatNumbered(lines)}` : `failed checks:`;
-          slackParts.push(`${header}${tableBlock}${makeStatus}${draftNote}`);
+          slackParts.push(`${header}${tableBlock2}${makeStatus2}${draftNote}`);
           failed++;
         }
       } else {
         // Only Title/Price/HSN/Tax actions (no New Product Checks)
         if (hadMakeTests && slackMakeLines.length) {
+          // If anyWebhookFailed is true, this is not a pure success
           const makeStatusBlock = `\n\nMake Webhook Stats -\n${slackMakeLines.map(l => `- ${l}`).join('\n')}`;
           slackParts.push(`tests processed.${makeStatusBlock}`);
         }
       }
 
       const final = slackParts.length ? `${slackMsg} ${slackParts.join('')}` : slackMsg;
-      await slackPost(final);
+
+      // Determine routing: success channel only for pure successes
+      // Success if: New Product Checks passed (passesAll path) AND no webhook failures,
+      // or (only tests) hadMakeTests AND no webhook failures.
+      let routeSuccess = false;
+      if (hasNewProductChecks) {
+        // success if message contains "checks passed" and no webhook failures noted
+        routeSuccess = /checks passed/i.test(final) && !anyWebhookFailed;
+      } else if (hadMakeTests) {
+        routeSuccess = !anyWebhookFailed;
+      }
+
+      await slackPost(final, { success: routeSuccess });
     }
 
     if (!conn.pageInfo.hasNextPage) break;
