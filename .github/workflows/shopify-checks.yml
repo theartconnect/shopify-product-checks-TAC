@@ -12,6 +12,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment:
+      name: secrets   # use Environment "secrets" for ${{ secrets.* }} and ${{ vars.* }}
 
     steps:
       - name: Show trigger info & time
@@ -31,6 +33,7 @@ jobs:
           SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
           SLACK_BOT_TOKEN:            ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID:           ${{ secrets.SLACK_CHANNEL_ID }}
+          SUCCESS_SLACK_CHANNEL_ID:   ${{ secrets.SUCCESS_SLACK_CHANNEL_ID }}
           RUN_START_IST:              ${{ vars.RUN_START_IST }}        # e.g. 8  (08:00 IST)
           RUN_END_IST:                ${{ vars.RUN_END_IST }}          # e.g. 23 (23:00 IST)
           SHOPIFY_API_VERSION:        ${{ vars.SHOPIFY_API_VERSION }}  # e.g. 2025-07
@@ -42,6 +45,7 @@ jobs:
           test -n "${SHOPIFY_ADMIN_ACCESS_TOKEN:-}"  || missing+=("secrets.SHOPIFY_ADMIN_ACCESS_TOKEN")
           test -n "${SLACK_BOT_TOKEN:-}"             || missing+=("secrets.SLACK_BOT_TOKEN")
           test -n "${SLACK_CHANNEL_ID:-}"            || missing+=("secrets.SLACK_CHANNEL_ID")
+          test -n "${SUCCESS_SLACK_CHANNEL_ID:-}"    || missing+=("secrets.SUCCESS_SLACK_CHANNEL_ID")
           test -n "${RUN_START_IST:-}"               || missing+=("vars.RUN_START_IST")
           test -n "${RUN_END_IST:-}"                 || missing+=("vars.RUN_END_IST")
           test -n "${SHOPIFY_API_VERSION:-}"         || missing+=("vars.SHOPIFY_API_VERSION")
@@ -90,9 +94,10 @@ jobs:
           SHOPIFY_ADMIN_ACCESS_TOKEN:  ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
           SLACK_BOT_TOKEN:             ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID:            ${{ secrets.SLACK_CHANNEL_ID }}
+          SUCCESS_SLACK_CHANNEL_ID:    ${{ secrets.SUCCESS_SLACK_CHANNEL_ID }}
           SHOPIFY_API_VERSION:         ${{ vars.SHOPIFY_API_VERSION }}
           DRY_RUN:                     ${{ vars.DRY_RUN }}
-          # Optional (set as a Repository Variable to see per-call GQL cost logs from index.js)
+          # Optional (Environment Variable) to see per-call GQL cost logs from index.js
           SHOPIFY_LOG_GRAPHQL_COSTS:   ${{ vars.SHOPIFY_LOG_GRAPHQL_COSTS }}
         run: |
           set -euo pipefail
@@ -102,6 +107,7 @@ jobs:
           SHOPIFY_API_VERSION=${SHOPIFY_API_VERSION}
           SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
           SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}
+          SUCCESS_SLACK_CHANNEL_ID=${SUCCESS_SLACK_CHANNEL_ID}
           DRY_RUN=${DRY_RUN}
           SHOPIFY_LOG_GRAPHQL_COSTS=${SHOPIFY_LOG_GRAPHQL_COSTS}
           EOF
@@ -136,7 +142,6 @@ jobs:
         run: |
           set -euo pipefail
           node -v && npm -v
-          # stdbuf makes Node flush line-by-line so you see output live in Actions.
           stdbuf -oL -eL node index.js | tee run.log
 
       - name: Upload run.log artifact
