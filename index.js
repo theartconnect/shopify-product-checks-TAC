@@ -130,6 +130,7 @@ const PRODUCTS_PAGE_QUERY = `
         metafieldTax: metafield(namespace: "custom", key: "indian_tax_rate") { value }
         metafieldPreOrder: metafield(namespace: "custom", key: "pre_order_setting") { value }
         metafieldOrigin: metafield(namespace: "my_fields", key: "country_of_origin") { value }
+        metafieldMainItemConfirm: metafield(namespace: "custom", key: "main_item_confirmation_status") { value }
       }
     }
   }
@@ -203,6 +204,15 @@ const PRODUCT_TAX_QUERY = `
   }
 `;
 
+const PRODUCT_MAIN_STATUS_QUERY = `
+  query ProductMainStatus($id: ID!) {
+    product(id: $id) {
+      id
+      metafield(namespace: "custom", key: "main_item_confirmation_status") { value }
+    }
+  }
+`;
+
 const UPDATE_PRODUCT_STATUS = `
   mutation UpdateProductStatus($id: ID!, $status: ProductStatus!) {
     productUpdate(input: { id: $id, status: $status }) {
@@ -239,7 +249,6 @@ const LOCATIONS_QUERY = `
   }
 `;
 
-/* Correct signature — single 'input' object */
 const INVENTORY_SET_ON_HAND = `
   mutation SetOnHand($input: InventorySetOnHandQuantitiesInput!) {
     inventorySetOnHandQuantities(input: $input) {
@@ -248,7 +257,6 @@ const INVENTORY_SET_ON_HAND = `
   }
 `;
 
-/* NEW: publications + publish */
 const PUBLICATIONS_QUERY = `
   query Publications($after: String) {
     publications(first: 100, after: $after) {
@@ -258,7 +266,6 @@ const PUBLICATIONS_QUERY = `
   }
 `;
 
-/* Market publications (to find the MarketCatalog titled "India") */
 const PUBLICATIONS_MARKETS_QUERY = `
   query MarketPubs($after: String) {
     publications(first: 50, after: $after, catalogType: MARKET) {
@@ -305,6 +312,13 @@ function parseListFromMetafield(mf) {
 }
 function parseStringFromMetafield(mf) { return (!mf || mf.value == null) ? '' : String(mf.value).trim(); }
 function parseTaxPercent(raw) { const m = raw ? String(raw).match(/^([0-9]+(?:\.[0-9]+)?)%/) : null; return m ? m[1] : null; }
+function parseBooleanFromMetafield(mf) {
+  if (!mf || mf.value == null) return null;
+  const v = String(mf.value).trim().toLowerCase();
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  return null;
+}
 
 function containsGlossaryTerm(text) {
   if (!text) return null;
@@ -683,6 +697,25 @@ async function setOnHandZeroForItems(inventoryItemIds) {
   }
 }
 
+/* Main item confirmation helpers */
+async function getMainItemConfirmationStatus(productId) {
+  const data = await shopifyGraphQL(PRODUCT_MAIN_STATUS_QUERY, { id: productId });
+  const mf = data?.product?.metafield || null;
+  return parseBooleanFromMetafield(mf); // null | true | false
+}
+async function setMainItemConfirmationStatus(productId, value /* boolean */) {
+  const metafields = [{
+    ownerId: productId,
+    namespace: 'custom',
+    key: 'main_item_confirmation_status',
+    type: 'boolean',
+    value: value ? 'true' : 'false',
+  }];
+  const data = await shopifyGraphQL(SET_METAFIELDS, { metafields });
+  const errs = data?.metafieldsSet?.userErrors || [];
+  if (errs.length) throw new Error(`metafieldsSet(main_item_confirmation_status): ${JSON.stringify(errs)}`);
+}
+
 /* =========================
    Webhook callers
 ========================= */
@@ -697,8 +730,8 @@ async function callMakeWebhook(payload) {
 }
 async function callUnitPriceWebhook(productId) {
   try {
-    const res = await axios.post(UNIT_PRICE_WEBHOOK_URL, { store: 'TAC' }, {
-      headers: { store: 'TAC', productid: productId },
+    const res = await axios.post(UNIT_PRICE_WEBHOOK_URL, { store: 'FI' }, {
+      headers: { store: 'FI', productid: productId },
       timeout: 30000
     });
     return { ok: res.status === 200, status: res.status };
@@ -749,14 +782,17 @@ async function run() {
       let hadMakeTests = false;
 
       try {
+        // DRY_RUN parity + payload parity with old code (store: 'FI')
         if (productChanges.includes(LABEL_TITLE_UPDATED)) {
           hadMakeTests = true;
-          const r = await callMakeWebhook({ store: 'TAC', title_modified: true, product_id: p.id });
+          const r = IS_DRY_RUN ? { ok: true, status: 200 } : await callMakeWebhook({ store: 'FI', title_modified: true, product_id: p.id });
           if (r.ok) {
             slackMakeLines.push('Title update information sent.');
-            const newList = productChanges.filter(v => v !== LABEL_TITLE_UPDATED);
-            await setProductChangesList(p.id, JSON.stringify(newList));
-            productChanges.splice(0, productChanges.length, ...newList);
+            if (!IS_DRY_RUN) {
+              const newList = productChanges.filter(v => v !== LABEL_TITLE_UPDATED);
+              await setProductChangesList(p.id, JSON.stringify(newList));
+              productChanges.splice(0, productChanges.length, ...newList);
+            }
           } else {
             anyWebhookFailed = true;
             slackMakeLines.push(`Title update failed${r.status ? ` (HTTP ${r.status})` : ''}.`);
@@ -764,12 +800,14 @@ async function run() {
         }
         if (productChanges.includes(LABEL_PRICE_UPDATED)) {
           hadMakeTests = true;
-          const r = await callMakeWebhook({ store: 'TAC', price_modified: true, product_id: p.id });
+          const r = IS_DRY_RUN ? { ok: true, status: 200 } : await callMakeWebhook({ store: 'FI', price_modified: true, product_id: p.id });
           if (r.ok) {
             slackMakeLines.push('Price update information sent.');
-            const newList = productChanges.filter(v => v !== LABEL_PRICE_UPDATED);
-            await setProductChangesList(p.id, JSON.stringify(newList));
-            productChanges.splice(0, productChanges.length, ...newList);
+            if (!IS_DRY_RUN) {
+              const newList = productChanges.filter(v => v !== LABEL_PRICE_UPDATED);
+              await setProductChangesList(p.id, JSON.stringify(newList));
+              productChanges.splice(0, productChanges.length, ...newList);
+            }
           } else {
             anyWebhookFailed = true;
             slackMakeLines.push(`Price update failed${r.status ? ` (HTTP ${r.status})` : ''}.`);
@@ -785,12 +823,14 @@ async function run() {
           }
           if (hsSet.size === 1) {
             const hsnValue = [...hsSet][0];
-            const r = await callMakeWebhook({ store: 'TAC', hsn_modified: true, hsn_value: hsnValue, product_id: p.id });
+            const r = IS_DRY_RUN ? { ok: true, status: 200 } : await callMakeWebhook({ store: 'FI', hsn_modified: true, hsn_value: hsnValue, product_id: p.id });
             if (r.ok) {
               slackMakeLines.push('HSN update information sent.');
-              const newList = productChanges.filter(v => v !== LABEL_HSN_UPDATED);
-              await setProductChangesList(p.id, JSON.stringify(newList));
-              productChanges.splice(0, productChanges.length, ...newList);
+              if (!IS_DRY_RUN) {
+                const newList = productChanges.filter(v => v !== LABEL_HSN_UPDATED);
+                await setProductChangesList(p.id, JSON.stringify(newList));
+                productChanges.splice(0, productChanges.length, ...newList);
+              }
             } else {
               anyWebhookFailed = true;
               slackMakeLines.push(`HSN update failed${r.status ? ` (HTTP ${r.status})` : ''}.`);
@@ -811,12 +851,14 @@ async function run() {
             const m = taxRaw5.match(/^([0-9]+(?:\.[0-9]+)?)%(.*)$/);
             if (m) { tax_percentage = m[1]; tax_id = (m[2] || '').trim(); }
           }
-          const r = await callMakeWebhook({ store: 'TAC', tax_modified: true, tax_percentage, tax_id, product_id: p.id });
+          const r = IS_DRY_RUN ? { ok: true, status: 200 } : await callMakeWebhook({ store: 'FI', tax_modified: true, tax_percentage, tax_id, product_id: p.id });
           if (r.ok) {
             slackMakeLines.push('Tax update information sent.');
-            const newList = productChanges.filter(v => v !== LABEL_TAX_UPDATED);
-            await setProductChangesList(p.id, JSON.stringify(newList));
-            productChanges.splice(0, productChanges.length, ...newList);
+            if (!IS_DRY_RUN) {
+              const newList = productChanges.filter(v => v !== LABEL_TAX_UPDATED);
+              await setProductChangesList(p.id, JSON.stringify(newList));
+              productChanges.splice(0, productChanges.length, ...newList);
+            }
           } else {
             anyWebhookFailed = true;
             slackMakeLines.push(`Tax update failed${r.status ? ` (HTTP ${r.status})` : ''}.`);
@@ -988,24 +1030,102 @@ async function run() {
 
         if (passesAll) {
           if (productIsMainItem) {
-            if (!IS_DRY_RUN) {
-              const newList = productChanges.filter(v => v !== LABEL_NEW_PRODUCT_CHECKS);
-              await setProductChangesList(p.id, JSON.stringify(newList));
+            // MAIN ITEM path
+            const myMainStatus = parseBooleanFromMetafield(p.metafieldMainItemConfirm); // null | true | false
+            if (myMainStatus === null) {
+              // Build a single-item payload for the main item
+              const mainVariant =
+                allVariants.find(v => {
+                  const parts = expectedMainSkuParts(v.sku || '');
+                  return parts && parts.digits === 0;
+                }) || allVariants[0];
+
+              const linkedName = linkedOptionName(p);
+              let variant_base_unit = null, variant_reference_unit = null, variant_numeric_quantity = null;
+              if (linkedName) {
+                const val = selectedValueForLinkedOption(mainVariant, linkedName);
+                if (val) {
+                  const handle = handleFromOptionValue(val);
+                  const meta = await getVariantOptionsMeta(handle);
+                  variant_base_unit = meta.variant_base_unit;
+                  variant_reference_unit = meta.variant_reference_unit;
+                  variant_numeric_quantity = meta.variant_numeric_quantity;
+                }
+              }
+
+              const taxRaw = parseStringFromMetafield(p.metafieldTax);
+              let tax_percentage = '', tax_id = '';
+              if (taxRaw) {
+                const m = taxRaw.match(/^([0-9]+(?:\.[0-9]+)?)%(.*)$/);
+                if (m) { tax_percentage = m[1]; tax_id = (m[2] || '').trim(); }
+              }
+
+              const itemSku = String(mainVariant?.sku || '').trim();
+              const item = {
+                sku: itemSku,
+                is_main_item: true,
+                rate: mainVariant?.price ?? null,
+                variant_title: computeVariantTitle(p.title, mainVariant),
+                variant_base_unit,
+                variant_reference_unit,
+                variant_numeric_quantity
+              };
+
+              const payload = {
+                store: 'FI',
+                product_id: p.id,
+                tax_percentage,
+                tax_id,
+                items: [item],
+                count: 1,
+                skus: [itemSku],
+                main_item_sku: itemSku || 'NA',
+                main_item_only: true
+              };
+
+              if (IS_DRY_RUN) {
+                slackParts.push(`would send main item-only SKU confirmation (main_item_only=true).${makeStatusBlock}`);
+              } else {
+                const r = await callSkuArrayWebhook(payload);
+                if (r.ok) {
+                  slackParts.push(`sent main item-only SKU confirmation (main_item_only=true).${makeStatusBlock}`);
+                  try {
+                    await setMainItemConfirmationStatus(p.id, true);
+                    slackParts.push(`\n- Set main_item_confirmation_status = true on main item (product ${p.id}).`);
+                  } catch (e) {
+                    anyWebhookFailed = true;
+                    slackParts.push(`\n- Failed to set main_item_confirmation_status = true on main item (product ${p.id}) after webhook 200.`);
+                  }
+                } else {
+                  anyWebhookFailed = true;
+                  slackParts.push(`failed to send main item-only SKU confirmation (HTTP ${r.status || 'n/a'}).${makeStatusBlock}`);
+                }
+              }
+            } else {
+              slackParts.push(`\n- main_item_confirmation_status already set (${myMainStatus}) on main item (product ${p.id}); main-only send skipped.${makeStatusBlock}`);
             }
+
+            // Status handling & publish
             const prevStatus = p.status;
             if (!IS_DRY_RUN && prevStatus === 'DRAFT') {
               await setProductStatusActive(p.id);
               await publishProductToAllPublications(p.id);
               await ensureProductInIndiaCatalog(p.id);
-              slackParts.push(`set to ACTIVE after all checks passed.${makeStatusBlock}`);
+              slackParts.push(`\nset to ACTIVE after all checks passed.`);
             } else if (prevStatus === 'ACTIVE') {
               await publishProductToAllPublications(p.id);
-              slackParts.push(`already ACTIVE; no status change. All checks passed.${makeStatusBlock}`);
+              slackParts.push(`\nalready ACTIVE; no status change. All checks passed.`);
             } else {
-              slackParts.push(`checks passed; status unchanged (${prevStatus}).${makeStatusBlock}`);
+              slackParts.push(`\nchecks passed; status unchanged (${prevStatus}).`);
+            }
+
+            if (!IS_DRY_RUN) {
+              const newList = productChanges.filter(v => v !== LABEL_NEW_PRODUCT_CHECKS);
+              await setProductChangesList(p.id, JSON.stringify(newList));
             }
             passed++;
           } else {
+            // COMPOSITE path
             const prevStatus = p.status;
             if (!IS_DRY_RUN && prevStatus === 'DRAFT') {
               await setProductStatusActive(p.id);
@@ -1045,7 +1165,20 @@ async function run() {
               for (const [gkey, g] of skuGroups.entries()) {
                 const items = [];
 
-                if (g.mainNode) {
+                if (g.mainNode && g.mainNode.product && g.mainNode.product.id) {
+                  try {
+                    const mainProductId = g.mainNode.product.id;
+                    const mainStatus = await getMainItemConfirmationStatus(mainProductId);
+                    if (mainStatus === null) {
+                      await setMainItemConfirmationStatus(mainProductId, false);
+                    } else {
+                      slackParts.push(`\n- main_item_confirmation_status already set (${mainStatus}) on main item (product ${mainProductId}); no change.`);
+                    }
+                  } catch {
+                    anyWebhookFailed = true;
+                    slackParts.push(`\n- Failed to read/set main_item_confirmation_status on main item (product ${g.mainNode.product.id}).`);
+                  }
+
                   const node = g.mainNode;
                   const productNode = node.product || {};
                   const productTitle = String(productNode?.title || p.title || '').trim();
@@ -1113,14 +1246,15 @@ async function run() {
                 const count = items.length;
                 const skus = items.map(it => it.sku);
                 const payload = {
-                  store: 'TAC',
+                  store: 'FI',
                   product_id: p.id,
                   tax_percentage,
                   tax_id,
                   items,
                   count,
                   skus,
-                  main_item_sku: g.isNonPattern ? 'NA' : (g.mainNode ? g.mainNode.sku : g.expectedMainSku)
+                  main_item_sku: g.isNonPattern ? 'NA' : (g.mainNode ? g.mainNode.sku : g.expectedMainSku),
+                  main_item_only: false
                 };
 
                 const r = await callSkuArrayWebhook(payload);
@@ -1211,7 +1345,6 @@ async function run() {
       } else {
         // Only Title/Price/HSN/Tax actions (no New Product Checks)
         if (hadMakeTests && slackMakeLines.length) {
-          // If anyWebhookFailed is true, this is not a pure success
           const makeStatusBlock = `\n\nMake Webhook Stats -\n${slackMakeLines.map(l => `- ${l}`).join('\n')}`;
           slackParts.push(`tests processed.${makeStatusBlock}`);
         }
@@ -1220,11 +1353,8 @@ async function run() {
       const final = slackParts.length ? `${slackMsg} ${slackParts.join('')}` : slackMsg;
 
       // Determine routing: success channel only for pure successes
-      // Success if: New Product Checks passed (passesAll path) AND no webhook failures,
-      // or (only tests) hadMakeTests AND no webhook failures.
       let routeSuccess = false;
       if (hasNewProductChecks) {
-        // success if message contains "checks passed" and no webhook failures noted
         routeSuccess = /checks passed/i.test(final) && !anyWebhookFailed;
       } else if (hadMakeTests) {
         routeSuccess = !anyWebhookFailed;
