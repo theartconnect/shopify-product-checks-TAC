@@ -24,7 +24,7 @@ const LABEL_PRICE_UPDATED      = 'Price Updated';
 const LABEL_HSN_UPDATED        = 'HSN Updated';
 const LABEL_TAX_UPDATED        = 'Tax Updated';
 
-if (!SHOPIFY__DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
+if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
   console.error('Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN in .env');
   if (globalThis.process && globalThis.process.exit) globalThis.process.exit(1);
 }
@@ -1102,7 +1102,7 @@ async function run() {
                 }
               }
             } else {
-              slackParts.push(`\n- main-itemm-only send skipped.${makeStatusBlock}`);
+              slackParts.push(`\n- main-item-only send skipped.${makeStatusBlock}`);
             }
 
             // Status handling & publish
