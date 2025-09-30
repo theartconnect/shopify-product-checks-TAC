@@ -291,6 +291,27 @@ const PUBLISHABLE_PUBLISH = `
   }
 `;
 
+/* ---------- NEW: Images GraphQL ---------- */
+const PRODUCT_IMAGES_PAGE_QUERY = `
+  query ProductImages($id: ID!, $after: String) {
+    product(id: $id) {
+      images(first: 250, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id altText }
+      }
+    }
+  }
+`;
+
+const PRODUCT_IMAGE_UPDATE = `
+  mutation ProductImageUpdate($image: ImageInput!) {
+    productImageUpdate(image: $image) {
+      image { id altText }
+      userErrors { field message }
+    }
+  }
+`;
+
 /* =========================
    Helpers
 ========================= */
@@ -368,6 +389,27 @@ async function getAllCollections(productId, initial) {
     cursor = page.pageInfo.endCursor;
   }
   return nodes;
+}
+
+/* ---------- NEW: Images helpers ---------- */
+async function getAllProductImages(productId) {
+  let after = null;
+  const nodes = [];
+  while (true) {
+    const data = await shopifyGraphQL(PRODUCT_IMAGES_PAGE_QUERY, { id: productId, after });
+    const page = data?.product?.images;
+    if (!page) break;
+    nodes.push(...(page.nodes || []));
+    if (!page.pageInfo?.hasNextPage) break;
+    after = page.pageInfo.endCursor;
+  }
+  return nodes;
+}
+async function updateImageAltText(imageId, altText) {
+  const res = await shopifyGraphQL(PRODUCT_IMAGE_UPDATE, { image: { id: imageId, altText } });
+  const errs = res?.productImageUpdate?.userErrors || [];
+  if (errs.length) throw new Error(`productImageUpdate: ${JSON.stringify(errs)}`);
+  return res?.productImageUpdate?.image;
 }
 
 async function setProductStatusActive(productId) {
@@ -926,6 +968,37 @@ async function run() {
 
         const hasImage = (p.images && p.images.edges && p.images.edges.length > 0);
         const isImageEmpty = !hasImage;
+
+        /* ---------- NEW: Set image alt text = product name (+ Slack lines) ---------- */
+        const successParts = [];
+        const failureParts = [];
+        if (hasImage) {
+          try {
+            const productName = (p.title || '').trim();
+            let changed = 0;
+            const allImages = await getAllProductImages(p.id);
+            for (const img of allImages) {
+              const currentAlt = (img.altText || '').trim();
+              if (currentAlt !== productName) {
+                if (!IS_DRY_RUN) {
+                  await updateImageAltText(img.id, productName);
+                }
+                changed += 1;
+              }
+            }
+            if (changed > 0) {
+              successParts.push(`\n- ${IS_DRY_RUN ? 'Would set' : 'Set'} alt text on ${changed} image(s) to product name.`);
+            } else {
+              successParts.push('\n- Image alt text already matches product name.');
+            }
+          } catch (e) {
+            failureParts.push('\n- Failed to update image alt text for one or more images.');
+            console.warn('Alt text update error:', e?.response?.data || e.message || e);
+          }
+        }
+        if (successParts.length) slackParts.push(successParts.join(''));
+        if (failureParts.length) slackParts.push(failureParts.join(''));
+        /* ---------- END NEW ---------- */
 
         const allCollections = await getAllCollections(p.id, p.collections);
         const isCollectionAssigned = !!(percentStr && allCollections.some(c =>
