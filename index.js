@@ -1064,7 +1064,7 @@ async function run() {
         const duplicateSkus = new Set();
         let taxMismatchWithMain = false;
 
-        const skuGroups = new Map(); // key: 'NONPATTERN' or base+tail
+        const skuGroupsForChecks = new Map(); // used for missing main detection in checks
         const missingMainGroups = [];
 
         for (const v of allVariants) {
@@ -1085,14 +1085,14 @@ async function run() {
             mainExists = exists ? 'Yes' : 'No';
 
             const gkey = parts.groupKey;
-            if (!skuGroups.has(gkey)) {
-              skuGroups.set(gkey, { expectedMainSku: parts.candidate, mainNode: null, items: [], isNonPattern: false });
+            if (!skuGroupsForChecks.has(gkey)) {
+              skuGroupsForChecks.set(gkey, { expectedMainSku: parts.candidate, mainNode: null, items: [], isNonPattern: false });
             }
-            skuGroups.get(gkey).items.push({ variant: v, label });
+            skuGroupsForChecks.get(gkey).items.push({ variant: v, label });
 
-            if (exists && !skuGroups.get(gkey).mainNode) {
+            if (exists && !skuGroupsForChecks.get(gkey).mainNode) {
               const mn = await getVariantNodeByExactSku(parts.candidate);
-              skuGroups.get(gkey).mainNode = mn || null;
+              skuGroupsForChecks.get(gkey).mainNode = mn || null;
               try {
                 if (mn?.product?.id) {
                   const mainTax = await getProductTax(mn.product.id);
@@ -1104,10 +1104,10 @@ async function run() {
             }
           } else {
             const gkey = 'NONPATTERN';
-            if (!skuGroups.has(gkey)) {
-              skuGroups.set(gkey, { expectedMainSku: 'NA', mainNode: null, items: [], isNonPattern: true });
+            if (!skuGroupsForChecks.has(gkey)) {
+              skuGroupsForChecks.set(gkey, { expectedMainSku: 'NA', mainNode: null, items: [], isNonPattern: true });
             }
-            skuGroups.get(gkey).items.push({ variant: v, label });
+            skuGroupsForChecks.get(gkey).items.push({ variant: v, label });
           }
 
           let hasIssue = false;
@@ -1123,7 +1123,7 @@ async function run() {
           }
         }
 
-        for (const [gkey, g] of skuGroups.entries()) {
+        for (const [gkey, g] of skuGroupsForChecks.entries()) {
           if (!g.isNonPattern && !g.mainNode) {
             missingMainGroups.push({ groupKey: gkey, expected: g.expectedMainSku });
           }
@@ -1183,7 +1183,6 @@ async function run() {
               }
 
               const itemSku = String(mainVariant?.sku || '').trim();
-              // Prefer the main variant's HS code; fall back to product-level unique HSN
               const mainVariantHsn = (mainVariant?.inventoryItem?.harmonizedSystemCode || '').trim();
               const hsn_value = mainVariantHsn || productHsn || null;
 
@@ -1289,24 +1288,59 @@ async function run() {
                 if (m) { tax_percentage = m[1]; tax_id = taxIdForPercentStr(tax_percentage); }
               }
 
-              // Send SKU arrays per group
-              const skuGroups = new Map(); // rebuilt for composite path
+              /* ========= FIXED: main-item detection + main_item_sku in composite path ========= */
+              const skuGroups = new Map();
+
+              // Build groups (patterned vs nonpattern)
               for (const v of allVariants) {
-                const parts = expectedMainSkuParts(v.sku || '');
-                const key = parts ? parts.groupKey : 'NONPATTERN';
-                if (!skuGroups.has(key)) {
-                  skuGroups.set(key, { isNonPattern: !parts, mainNode: null, items: [] });
+                const sku = String(v.sku || '').trim();
+                const parts = expectedMainSkuParts(sku);
+
+                if (parts) {
+                  const key = parts.groupKey;
+                  if (!skuGroups.has(key)) {
+                    skuGroups.set(key, {
+                      isNonPattern: false,
+                      expectedMainSku: parts.candidate, // e.g., ART2019-0
+                      mainSku: null,                    // set if -0 exists in THIS product
+                      items: []
+                    });
+                  }
+                  const g = skuGroups.get(key);
+                  if (parts.digits === 0 && sku) g.mainSku = sku;
+                  g.items.push(v);
+                } else {
+                  const key = 'NONPATTERN';
+                  if (!skuGroups.has(key)) {
+                    skuGroups.set(key, {
+                      isNonPattern: true,
+                      expectedMainSku: 'NA',
+                      mainSku: null,
+                      items: []
+                    });
+                  }
+                  skuGroups.get(key).items.push(v);
                 }
-                skuGroups.get(key).items.push(v);
               }
 
               for (const [gkey, g] of skuGroups.entries()) {
                 const items = [];
 
-                // we skip mainNode lookup complexity here (unchanged from your previous composite logic)
+                // Decide group main
+                const mainSku = g.isNonPattern
+                  ? (g.items[0]?.sku || 'NA')
+                  : (g.mainSku || g.expectedMainSku);
+
                 for (const v of g.items) {
-                  if (!v.sku) continue;
+                  const vSku = String(v.sku || '').trim();
+                  if (!vSku) continue;
+
+                  const isMain = g.isNonPattern
+                    ? true
+                    : (vSku.toLowerCase() === String(mainSku || '').toLowerCase());
+
                   const variant_title = computeVariantTitle(p.title, v);
+
                   const ln = linkedOptionName({ options: p.options });
                   let variant_base_unit = null, variant_reference_unit = null, variant_numeric_quantity = null;
                   if (ln) {
@@ -1319,9 +1353,10 @@ async function run() {
                       variant_numeric_quantity = meta.variant_numeric_quantity;
                     }
                   }
+
                   items.push({
-                    sku: String(v.sku),
-                    is_main_item: g.isNonPattern ? true : false,
+                    sku: vSku,
+                    is_main_item: isMain,
                     rate: v?.price ?? null,
                     variant_title,
                     variant_base_unit,
@@ -1332,16 +1367,17 @@ async function run() {
 
                 const count = items.length;
                 const skus = items.map(it => it.sku);
+
                 const payload = {
                   store: 'TAC',
                   product_id: p.id,
                   tax_percentage,
                   tax_id,
-                  hsn_value: productHsn,
+                  hsn_value: productHsn, // unique product-level HSN if resolvable
                   items,
                   count,
                   skus,
-                  main_item_sku: g.isNonPattern ? 'NA' : undefined,
+                  main_item_sku: mainSku || (g.isNonPattern ? 'NA' : g.expectedMainSku),
                   main_item_only: false
                 };
 
@@ -1351,6 +1387,7 @@ async function run() {
                   allSkuGroupsOK = false;
                 }
               }
+              /* ========= END FIX ========= */
 
               skuNote = allSkuGroupsOK
                 ? '\nNote: Data sent for Zoho item confirmation.'
