@@ -1206,7 +1206,7 @@ async function run() {
                 count: 1,
                 skus: [itemSku],
                 main_item_sku: itemSku || 'NA',
-                main_item_id: mainVariant?.id || null,   // <-- include GID of the main item
+                main_item_id: p.id,           // <-- PRODUCT GID for the main item (this product)
                 main_item_only: true
               };
 
@@ -1289,7 +1289,7 @@ async function run() {
                 if (m) { tax_percentage = m[1]; tax_id = taxIdForPercentStr(tax_percentage); }
               }
 
-              /* ========= main-item detection + main_item_id in composite path ========= */
+              /* ========= main-item detection + PRODUCT GID in composite path ========= */
               const skuGroups = new Map();
 
               // Build groups (patterned vs nonpattern)
@@ -1329,18 +1329,16 @@ async function run() {
 
                 // Decide group main
                 const mainSku = g.isNonPattern
-                  ? (g.items[0]?.sku || 'NA')
-                  : (g.mainSku || g.expectedMainSku);
+                  ? (g.items[0]?.sku || null)
+                  : (g.mainSku || g.expectedMainSku || null);
 
-                // Resolve main_item_id only when the main SKU actually exists among this group's variants
+                // Resolve PRODUCT GID of the main item (storewide if needed)
                 let main_item_id = null;
                 if (g.isNonPattern) {
-                  main_item_id = g.items[0]?.id || null;
-                } else {
-                  const mainNode = g.items.find(v =>
-                    String(v.sku || '').toLowerCase() === String(mainSku || '').toLowerCase()
-                  );
-                  main_item_id = mainNode?.id || null; // null when expected main doesn't exist in this product
+                  main_item_id = p.id; // non-pattern group belongs to this product
+                } else if (mainSku) {
+                  const mn = await getVariantNodeByExactSku(mainSku);
+                  main_item_id = mn?.product?.id || null; // product GID if main SKU exists anywhere in the store
                 }
 
                 for (const v of g.items) {
@@ -1389,8 +1387,8 @@ async function run() {
                   items,
                   count,
                   skus,
-                  main_item_sku: mainSku || (g.isNonPattern ? 'NA' : g.expectedMainSku),
-                  main_item_id, // <-- include GID of the main item when identified
+                  main_item_sku: mainSku || (g.isNonPattern ? skus[0] || 'NA' : g.expectedMainSku),
+                  main_item_id, // <-- PRODUCT GID of identified main item; null if not found storewide
                   main_item_only: false
                 };
 
