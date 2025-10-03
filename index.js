@@ -404,7 +404,7 @@ async function getAllProductMediaImages(productId) {
     const data = await shopifyGraphQL(PRODUCT_MEDIA_PAGE_QUERY, { id: productId, after });
     const page = data?.product?.media;
     if (!page) break;
-    const imgs = (page.nodes || []).filter(n => n && n.id); // only MediaImage nodes present in query
+    const imgs = (page.nodes || []).filter(n => n && n.id);
     nodes.push(...imgs);
     if (!page.pageInfo?.hasNextPage) break;
     after = page.pageInfo.endCursor;
@@ -1206,6 +1206,7 @@ async function run() {
                 count: 1,
                 skus: [itemSku],
                 main_item_sku: itemSku || 'NA',
+                main_item_id: mainVariant?.id || null,   // <-- include GID of the main item
                 main_item_only: true
               };
 
@@ -1288,7 +1289,7 @@ async function run() {
                 if (m) { tax_percentage = m[1]; tax_id = taxIdForPercentStr(tax_percentage); }
               }
 
-              /* ========= FIXED: main-item detection + main_item_sku in composite path ========= */
+              /* ========= main-item detection + main_item_id in composite path ========= */
               const skuGroups = new Map();
 
               // Build groups (patterned vs nonpattern)
@@ -1301,7 +1302,7 @@ async function run() {
                   if (!skuGroups.has(key)) {
                     skuGroups.set(key, {
                       isNonPattern: false,
-                      expectedMainSku: parts.candidate, // e.g., ART2019-0
+                      expectedMainSku: parts.candidate, // e.g., ABC-0
                       mainSku: null,                    // set if -0 exists in THIS product
                       items: []
                     });
@@ -1330,6 +1331,17 @@ async function run() {
                 const mainSku = g.isNonPattern
                   ? (g.items[0]?.sku || 'NA')
                   : (g.mainSku || g.expectedMainSku);
+
+                // Resolve main_item_id only when the main SKU actually exists among this group's variants
+                let main_item_id = null;
+                if (g.isNonPattern) {
+                  main_item_id = g.items[0]?.id || null;
+                } else {
+                  const mainNode = g.items.find(v =>
+                    String(v.sku || '').toLowerCase() === String(mainSku || '').toLowerCase()
+                  );
+                  main_item_id = mainNode?.id || null; // null when expected main doesn't exist in this product
+                }
 
                 for (const v of g.items) {
                   const vSku = String(v.sku || '').trim();
@@ -1378,6 +1390,7 @@ async function run() {
                   count,
                   skus,
                   main_item_sku: mainSku || (g.isNonPattern ? 'NA' : g.expectedMainSku),
+                  main_item_id, // <-- include GID of the main item when identified
                   main_item_only: false
                 };
 
@@ -1387,7 +1400,7 @@ async function run() {
                   allSkuGroupsOK = false;
                 }
               }
-              /* ========= END FIX ========= */
+              /* ========= END ========= */
 
               skuNote = allSkuGroupsOK
                 ? '\nNote: Data sent for Zoho item confirmation.'
@@ -1416,7 +1429,7 @@ async function run() {
             passed++;
           }
         } else {
-          // Fail path
+          // Fail path (NO LONGER setting product to DRAFT; only Slack notify)
           const lines = buildFailureLines({
             hasIndianTax,
             percentStr,
@@ -1457,14 +1470,9 @@ async function run() {
             ? `\n\nMake Webhook Stats -\n${slackMakeLines.map(l => `- ${l}`).join('\n')}`
             : '';
 
-          const wasActive = p.status === 'ACTIVE';
-          if (!IS_DRY_RUN && p.status !== 'DRAFT') {
-            await setProductStatusDraft(p.id);
-          }
-
-          const draftNote = wasActive ? `\n\nAction: Product has been set to DRAFT from ACTIVE.` : '';
           const header = lines.length ? `failed checks:\n${formatNumbered(lines)}` : `failed checks:`;
-          slackParts.push(`${header}${tableBlock2}${makeStatus2}${draftNote}`);
+          // Only send Slack message; do NOT flip status to DRAFT
+          slackParts.push(`${header}${tableBlock2}${makeStatus2}`);
           failed++;
         }
       } else {
