@@ -105,6 +105,7 @@ const PRODUCTS_PAGE_QUERY = `
       pageInfo { hasNextPage endCursor }
       nodes {
         id
+        handle
         title
         status
         vendor
@@ -291,7 +292,7 @@ const PUBLISHABLE_PUBLISH = `
   }
 `;
 
-/* ---------- NEW: Media GraphQL for alt text ---------- */
+/* ---------- Media GraphQL for alt text ---------- */
 const PRODUCT_MEDIA_PAGE_QUERY = `
   query ProductMedia($id: ID!, $after: String) {
     product(id: $id) {
@@ -396,7 +397,7 @@ async function getAllCollections(productId, initial) {
   return nodes;
 }
 
-/* ---------- NEW: Media helpers for alt text ---------- */
+/* ---------- Media helpers for alt text (silent) ---------- */
 async function getAllProductMediaImages(productId) {
   let after = null;
   const nodes = [];
@@ -976,7 +977,26 @@ async function run() {
       if (!hasNewProductChecks && !hadMakeTests) continue;
 
       if (hasNewProductChecks) {
-        // ---- New Product Checks
+        /* ---------- "copy" guard: fail checks, set to DRAFT, no webhooks ---------- */
+        const nameHasCopy = /copy/i.test(p.title || '');
+        const handleHasCopy = /copy/i.test(p.handle || '');
+        if (nameHasCopy || handleHasCopy) {
+          const where = [
+            nameHasCopy ? 'name' : null,
+            handleHasCopy ? 'url' : null
+          ].filter(Boolean).join(' & ');
+          if (!IS_DRY_RUN) {
+            try { await setProductStatusDraft(p.id); }
+            catch (e) { console.warn('Failed to set DRAFT on copy-flagged product:', e?.response?.data || e.message || e); }
+          }
+          const failNote = `failed checks:\n1. Blocked: product ${where} contains "copy".\n(Checks aborted; no SKU/product webhooks sent. Product set to DRAFT.)`;
+          const finalCopy = `${slackMsg} ${failNote}`;
+          await slackPost(finalCopy, { success: false });
+          failed++;
+          continue; // Skip the rest of checks & any webhooks
+        }
+        /* ------------------------------------------------------------------------- */
+
         const indianTaxRateRaw = parseStringFromMetafield(p.metafieldTax);
         const hasIndianTax = !!indianTaxRateRaw;
         const percentStr = parseTaxPercent(indianTaxRateRaw);
@@ -993,27 +1013,16 @@ async function run() {
         const hasImage = (p.images && p.images.edges && p.images.edges.length > 0);
         const isImageEmpty = !hasImage;
 
-        /* ---------- NEW: Set image alt text = product name (+ Slack lines) ---------- */
-        const successParts = [];
-        const failureParts = [];
+        /* ---------- Silent alt-text alignment (no Slack messages) ---------- */
         if (hasImage) {
           try {
             const productName = (p.title || '').trim();
-            const { changed } = await setAltTextForProductImages(p.id, productName);
-
-            if (changed > 0) {
-              successParts.push(`\n- ${IS_DRY_RUN ? 'Would set' : 'Set'} alt text on ${changed} image(s) to product name.`);
-            } else {
-              successParts.push('\n- Image alt text already matches product name.');
-            }
+            await setAltTextForProductImages(p.id, productName);
           } catch (e) {
-            failureParts.push('\n- Failed to update image alt text for one or more images.');
             console.warn('Alt text update error:', e?.response?.data || e.message || e);
           }
         }
-        if (successParts.length) slackParts.push(successParts.join(''));
-        if (failureParts.length) slackParts.push(failureParts.join(''));
-        /* ---------- END NEW ---------- */
+        /* ------------------------------------------------------------------ */
 
         const allCollections = await getAllCollections(p.id, p.collections);
         const isCollectionAssigned = !!(percentStr && allCollections.some(c =>
@@ -1022,7 +1031,7 @@ async function run() {
 
         const allVariants = await getAllVariants(p.id, p.variants);
 
-        // NEW: product-level HSN (only if unique across variants)
+        // product-level HSN (only if unique across variants)
         const productHsn = getUniqueHsnFromVariants(allVariants);
 
         // Main-item classification (all patterned SKUs are -0)
@@ -1205,8 +1214,8 @@ async function run() {
                 items: [item],
                 count: 1,
                 skus: [itemSku],
-                main_item_sku: itemSku || 'NA',
-                main_item_id: p.id,           // <-- PRODUCT GID for the main item (this product)
+                main_item_sku: itemSku,
+                main_item_id: p.id,           // main item is this product
                 main_item_only: true
               };
 
@@ -1334,12 +1343,13 @@ async function run() {
 
                 // Resolve PRODUCT GID of the main item (storewide if needed)
                 let main_item_id = null;
-                if (g.isNonPattern) {
-                  main_item_id = p.id; // non-pattern group belongs to this product
-                } else if (mainSku) {
+                if (!g.isNonPattern && mainSku) {
                   const mn = await getVariantNodeByExactSku(mainSku);
-                  main_item_id = mn?.product?.id || null; // product GID if main SKU exists anywhere in the store
+                  const candidateId = mn?.product?.id || null;
+                  // Only set if the identified main item product is different from current
+                  main_item_id = (candidateId && candidateId !== p.id) ? candidateId : null;
                 }
+                // For NONPATTERN groups, requirement is specifically about "-0" main; keep null.
 
                 for (const v of g.items) {
                   const vSku = String(v.sku || '').trim();
@@ -1388,7 +1398,7 @@ async function run() {
                   count,
                   skus,
                   main_item_sku: mainSku || (g.isNonPattern ? skus[0] || 'NA' : g.expectedMainSku),
-                  main_item_id, // <-- PRODUCT GID of identified main item; null if not found storewide
+                  main_item_id, // PRODUCT GID of identified -0 item's product when different from current; else null
                   main_item_only: false
                 };
 
@@ -1427,7 +1437,7 @@ async function run() {
             passed++;
           }
         } else {
-          // Fail path (NO LONGER setting product to DRAFT; only Slack notify)
+          // Fail path (keep existing behavior: notify only; do not set to DRAFT here)
           const lines = buildFailureLines({
             hasIndianTax,
             percentStr,
@@ -1469,7 +1479,6 @@ async function run() {
             : '';
 
           const header = lines.length ? `failed checks:\n${formatNumbered(lines)}` : `failed checks:`;
-          // Only send Slack message; do NOT flip status to DRAFT
           slackParts.push(`${header}${tableBlock2}${makeStatus2}`);
           failed++;
         }
