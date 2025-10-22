@@ -1080,25 +1080,20 @@ async function run() {
           const label = variantLabel(v);
           const sku = v.sku ? String(v.sku).trim() : '';
           const hs = v.inventoryItem?.harmonizedSystemCode ? String(v.inventoryItem.harmonizedSystemCode).trim() : '';
-
           if (sku) {
             const dup = await hasDuplicateSkuStorewide(sku, v.id);
             if (dup) duplicateSkus.add(sku);
           }
-
           let mainExists = 'N/A';
           const parts = expectedMainSkuParts(sku);
-
           if (parts) {
             const exists = await skuExistsCaseInsensitive(parts.candidate);
             mainExists = exists ? 'Yes' : 'No';
-
             const gkey = parts.groupKey;
             if (!skuGroupsForChecks.has(gkey)) {
               skuGroupsForChecks.set(gkey, { expectedMainSku: parts.candidate, mainNode: null, items: [], isNonPattern: false });
             }
             skuGroupsForChecks.get(gkey).items.push({ variant: v, label });
-
             if (exists && !skuGroupsForChecks.get(gkey).mainNode) {
               const mn = await getVariantNodeByExactSku(parts.candidate);
               skuGroupsForChecks.get(gkey).mainNode = mn || null;
@@ -1122,7 +1117,6 @@ async function run() {
           let hasIssue = false;
           const skuCell = sku ? sku : 'Fill in';
           const hsCell = hs ? hs : 'Fill in';
-
           if (!hs) hasIssue = true;
           if (parts && mainExists === 'No') hasIssue = true;
           if (!sku && parts) hasIssue = true;
@@ -1215,7 +1209,7 @@ async function run() {
                 count: 1,
                 skus: [itemSku],
                 main_item_sku: itemSku,
-                main_item_id: p.id,           // main item is this product
+                main_item_id: p.id,
                 main_item_only: true
               };
 
@@ -1346,10 +1340,8 @@ async function run() {
                 if (!g.isNonPattern && mainSku) {
                   const mn = await getVariantNodeByExactSku(mainSku);
                   const candidateId = mn?.product?.id || null;
-                  // Only set if the identified main item product is different from current
                   main_item_id = (candidateId && candidateId !== p.id) ? candidateId : null;
                 }
-                // For NONPATTERN groups, requirement is specifically about "-0" main; keep null.
 
                 for (const v of g.items) {
                   const vSku = String(v.sku || '').trim();
@@ -1437,7 +1429,7 @@ async function run() {
             passed++;
           }
         } else {
-          // Fail path (keep existing behavior: notify only; do not set to DRAFT here)
+          // ---------- FAIL PATH: FORCE SET TO DRAFT ----------
           const lines = buildFailureLines({
             hasIndianTax,
             percentStr,
@@ -1478,8 +1470,15 @@ async function run() {
             ? `\n\nMake Webhook Stats -\n${slackMakeLines.map(l => `- ${l}`).join('\n')}`
             : '';
 
+          // NEW: force to DRAFT on any failure
+          if (!IS_DRY_RUN) {
+            try { await setProductStatusDraft(p.id); }
+            catch (e) { console.warn('Failed to set DRAFT on failed product:', e?.response?.data || e.message || e); }
+          }
+
           const header = lines.length ? `failed checks:\n${formatNumbered(lines)}` : `failed checks:`;
-          slackParts.push(`${header}${tableBlock2}${makeStatus2}`);
+          const draftNote = `\nProduct set to DRAFT due to failed checks.`;
+          slackParts.push(`${header}${tableBlock2}${makeStatus2}${draftNote}`);
           failed++;
         }
       } else {
